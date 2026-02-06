@@ -177,3 +177,59 @@ export function updateMapping(destDir, updates) {
     writeFileSync(mapPath, JSON.stringify(updated, null, 2), 'utf-8');
     return updated;
 }
+
+/**
+ * Load existing raw mapping (without decryption) for merging
+ */
+export function loadRawMapping(cloakedDir) {
+    const mapPath = join(cloakedDir, MAP_FILENAME);
+
+    if (!existsSync(mapPath)) {
+        return null;
+    }
+
+    try {
+        const content = readFileSync(mapPath, 'utf-8');
+        return JSON.parse(content);
+    } catch (error) {
+        return null;
+    }
+}
+
+/**
+ * Merge new files into existing mapping (for incremental pulls)
+ */
+export function mergeMapping(existingMapping, newFiles) {
+    // Get existing file paths for deduplication
+    const existingPaths = new Set(
+        (existingMapping.files || []).map(f => f.cloaked)
+    );
+
+    // Filter out files that already exist (avoid duplicates)
+    const uniqueNewFiles = newFiles.filter(f => !existingPaths.has(f.cloaked));
+
+    // Merge files
+    const mergedFiles = [
+        ...(existingMapping.files || []),
+        ...uniqueNewFiles
+    ];
+
+    // Track pull history
+    const pullHistory = existingMapping.pullHistory || [];
+    pullHistory.push({
+        timestamp: new Date().toISOString(),
+        filesAdded: uniqueNewFiles.length,
+        totalFiles: mergedFiles.length
+    });
+
+    return {
+        ...existingMapping,
+        files: mergedFiles,
+        pullHistory,
+        stats: {
+            ...existingMapping.stats,
+            totalFiles: mergedFiles.length
+        },
+        updatedAt: new Date().toISOString()
+    };
+}

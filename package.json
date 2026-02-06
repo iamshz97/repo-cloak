@@ -1,6 +1,6 @@
 {
   "name": "repo-cloak-cli",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "🎭 Selectively extract and anonymize files from repositories. Perfect for sharing code with AI agents without exposing proprietary details.",
   "main": "src/index.js",
   "type": "module",
@@ -10,7 +10,8 @@
   },
   "scripts": {
     "start": "node bin/repo-cloak.js",
-    "test": "node --test",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lint": "eslint src/"
   },
   "keywords": [
@@ -43,5 +44,8 @@
     "glob": "^10.3.10",
     "inquirer": "^9.2.12",
     "ora": "^8.0.1"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
   }
 }

@@ -19,7 +19,7 @@ import { showSuccess, showError, showInfo } from '../ui/banner.js';
 import { getAllFiles } from '../core/scanner.js';
 import { copyFiles } from '../core/copier.js';
 import { createAnonymizer } from '../core/anonymizer.js';
-import { createMapping, saveMapping } from '../core/mapper.js';
+import { createMapping, saveMapping, loadRawMapping, mergeMapping, hasMapping } from '../core/mapper.js';
 
 export async function pull(options = {}) {
     try {
@@ -106,28 +106,49 @@ export async function pull(options = {}) {
             });
         }
 
-        // Step 8: Save mapping file with original->anonymized path tracking
-        const mapping = createMapping({
-            sourceDir,
-            destDir,
-            replacements,
-            files: selectedFiles.map(f => {
-                const originalPath = relative(sourceDir, f);
-                // Apply same anonymization logic used in copier
-                let anonymizedPath = originalPath;
-                for (const { original, replacement } of replacements) {
-                    const regex = new RegExp(original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-                    anonymizedPath = anonymizedPath.replace(regex, replacement);
-                }
-                return {
-                    original: originalPath,
-                    cloaked: anonymizedPath
-                };
-            })
+        // Step 8: Prepare new file mappings
+        const newFiles = selectedFiles.map(f => {
+            const originalPath = relative(sourceDir, f);
+            let anonymizedPath = originalPath;
+            for (const { original, replacement } of replacements) {
+                const regex = new RegExp(original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                anonymizedPath = anonymizedPath.replace(regex, replacement);
+            }
+            return {
+                original: originalPath,
+                cloaked: anonymizedPath
+            };
         });
 
+        // Step 9: Check for existing mapping and merge if found
+        const existingMapping = loadRawMapping(destDir);
+        let mapping;
+        let isIncremental = false;
+
+        if (existingMapping) {
+            // Merge with existing
+            mapping = mergeMapping(existingMapping, newFiles);
+            isIncremental = true;
+            console.log(chalk.cyan(`   🔄 Merged with existing mapping (incremental pull)`));
+        } else {
+            // Create new mapping
+            mapping = createMapping({
+                sourceDir,
+                destDir,
+                replacements,
+                files: newFiles
+            });
+        }
+
         const mapPath = saveMapping(destDir, mapping);
-        console.log(chalk.dim(`   📋 Mapping saved: ${mapPath}`));
+
+        if (isIncremental) {
+            const history = mapping.pullHistory || [];
+            const lastPull = history[history.length - 1];
+            console.log(chalk.dim(`   📋 Mapping updated: ${lastPull?.filesAdded || 0} new files added (total: ${mapping.stats?.totalFiles})`));
+        } else {
+            console.log(chalk.dim(`   📋 Mapping saved: ${mapPath}`));
+        }
 
         // Done!
         showSuccess('Extraction complete!');
