@@ -1,12 +1,14 @@
 /**
  * Push Command
  * Restore files with original names from a cloaked backup
+ * Now with decryption support!
  */
 
 import ora from 'ora';
 import chalk from 'chalk';
-import { existsSync, mkdirSync, readdirSync } from 'fs';
-import { resolve, join, relative } from 'path';
+import inquirer from 'inquirer';
+import { existsSync, mkdirSync } from 'fs';
+import { resolve, join } from 'path';
 
 import {
     promptBackupFolder,
@@ -17,7 +19,8 @@ import { showSuccess, showError, showInfo, showWarning } from '../ui/banner.js';
 import { getAllFiles } from '../core/scanner.js';
 import { copyFiles } from '../core/copier.js';
 import { createDeanonymizer } from '../core/anonymizer.js';
-import { loadMapping, hasMapping, getReplacements, getOriginalSource } from '../core/mapper.js';
+import { loadMapping, hasMapping, getReplacements, getOriginalSource, decryptMapping } from '../core/mapper.js';
+import { getOrCreateSecret, hasSecret, decrypt, getConfigDir } from '../core/crypto.js';
 
 export async function push(options = {}) {
     try {
@@ -38,12 +41,73 @@ export async function push(options = {}) {
             return;
         }
 
-        // Step 3: Load mapping
+        // Step 3: Load mapping (without decryption first to check if encrypted)
         const spinner = ora('Loading mapping file...').start();
-        const mapping = loadMapping(cloakedDir);
+        let rawMapping = loadMapping(cloakedDir);
         spinner.succeed('Mapping file loaded');
 
-        console.log(chalk.dim(`\n   Original source: ${mapping.source?.path || 'Unknown'}`));
+        let mapping = rawMapping;
+        let decryptionFailed = false;
+
+        // Step 4: Handle encryption
+        if (rawMapping.encrypted) {
+            console.log(chalk.cyan('\n   🔐 This backup was encrypted'));
+
+            if (hasSecret()) {
+                const secret = getOrCreateSecret();
+                try {
+                    mapping = decryptMapping(rawMapping, secret);
+                    console.log(chalk.green('   ✓ Decrypted successfully using your secret key'));
+                } catch (error) {
+                    decryptionFailed = true;
+                    console.log(chalk.yellow('   ⚠️  Decryption failed with your current secret'));
+                }
+            } else {
+                decryptionFailed = true;
+                console.log(chalk.yellow(`   ⚠️  No secret key found at ${getConfigDir()}`));
+            }
+
+            // If decryption failed, ask user for manual input
+            if (decryptionFailed) {
+                console.log(chalk.yellow('\n   Your secret key may have been lost or changed.'));
+                console.log(chalk.dim('   You can manually provide the original keywords to restore.\n'));
+
+                const manualReplacements = [];
+
+                for (const r of rawMapping.replacements || []) {
+                    const { original } = await inquirer.prompt([
+                        {
+                            type: 'input',
+                            name: 'original',
+                            message: `What was the original text for "${r.replacement}"?`,
+                            prefix: '🔑'
+                        }
+                    ]);
+
+                    if (original.trim()) {
+                        manualReplacements.push({
+                            original: original.trim(),
+                            replacement: r.replacement
+                        });
+                    }
+                }
+
+                mapping = {
+                    ...rawMapping,
+                    replacements: manualReplacements,
+                    source: { path: null },
+                    destination: { path: null },
+                    files: (rawMapping.files || []).map(f => ({
+                        original: f.cloaked, // Use cloaked as original if can't decrypt
+                        cloaked: f.cloaked
+                    }))
+                };
+            }
+        }
+
+        // Display info
+        const sourcePath = getOriginalSource(mapping);
+        console.log(chalk.dim(`\n   Original source: ${sourcePath || 'Unknown (encrypted)'}`));
         console.log(chalk.dim(`   Extracted on: ${mapping.timestamp}`));
         console.log(chalk.dim(`   Replacements: ${mapping.replacements?.length || 0}`));
         console.log(chalk.dim(`   Files: ${mapping.files?.length || 0}\n`));
@@ -52,35 +116,38 @@ export async function push(options = {}) {
         if (mapping.replacements && mapping.replacements.length > 0) {
             console.log(chalk.cyan('   Replacements to reverse:'));
             mapping.replacements.forEach(r => {
-                console.log(chalk.dim(`      "${r.replacement}" → "${r.original}"`));
+                if (r.original) {
+                    console.log(chalk.dim(`      "${r.replacement}" → "${r.original}"`));
+                } else {
+                    console.log(chalk.yellow(`      "${r.replacement}" → [ENCRYPTED]`));
+                }
             });
             console.log('');
         }
 
-        // Step 4: Get destination directory
-        const originalPath = getOriginalSource(mapping);
+        // Step 5: Get destination directory
         let destDir;
 
         if (options.dest) {
             destDir = resolve(options.dest);
-        } else if (originalPath && existsSync(originalPath)) {
+        } else if (sourcePath && existsSync(sourcePath)) {
             const useOriginal = await confirmAction(
-                `Restore to original location? (${originalPath})`
+                `Restore to original location? (${sourcePath})`
             );
 
             if (useOriginal) {
-                destDir = originalPath;
+                destDir = sourcePath;
             } else {
                 destDir = await promptDestinationDirectory();
             }
         } else {
-            if (originalPath) {
-                console.log(chalk.yellow(`   Original path no longer exists: ${originalPath}`));
+            if (sourcePath) {
+                console.log(chalk.yellow(`   Original path no longer exists: ${sourcePath}`));
             }
             destDir = await promptDestinationDirectory();
         }
 
-        // Step 5: Confirm
+        // Step 6: Confirm
         const confirmed = await confirmAction(
             `Restore ${mapping.files?.length || 0} files to ${destDir}?`
         );
@@ -90,7 +157,7 @@ export async function push(options = {}) {
             return;
         }
 
-        // Step 6: Get all files from cloaked directory
+        // Step 7: Get all files from cloaked directory
         const files = getAllFiles(cloakedDir);
 
         if (files.length === 0) {
@@ -98,16 +165,24 @@ export async function push(options = {}) {
             return;
         }
 
-        // Step 7: Create destination if needed
+        // Step 8: Create destination if needed
         if (!existsSync(destDir)) {
             mkdirSync(destDir, { recursive: true });
             console.log(chalk.dim(`   Created directory: ${destDir}`));
         }
 
-        // Step 8: Copy and de-anonymize files
+        // Step 9: Copy and de-anonymize files
         const restoreSpinner = ora('Restoring files...').start();
 
-        const deanonymizer = createDeanonymizer(getReplacements(mapping));
+        // Filter out any replacements where decryption failed
+        const validReplacements = (mapping.replacements || []).filter(r => r.original);
+        const deanonymizer = createDeanonymizer(validReplacements);
+
+        // Also pass reversed replacements for path restoration
+        const reversedReplacements = validReplacements.map(r => ({
+            original: r.replacement,
+            replacement: r.original
+        }));
 
         const results = await copyFiles(
             files,
@@ -116,10 +191,15 @@ export async function push(options = {}) {
             deanonymizer,
             (current, total, file) => {
                 restoreSpinner.text = `Restoring files... ${current}/${total} - ${file}`;
-            }
+            },
+            reversedReplacements // Pass for path de-anonymization
         );
 
         restoreSpinner.succeed(`Restored ${results.copied} files`);
+
+        if (results.pathsRenamed > 0) {
+            console.log(chalk.cyan(`   📁 ${results.pathsRenamed} paths restored`));
+        }
 
         if (results.transformed > 0) {
             console.log(chalk.cyan(`   📝 ${results.transformed} files had content restored`));

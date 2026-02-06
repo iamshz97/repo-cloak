@@ -1,6 +1,6 @@
 /**
  * Interactive File Selector
- * Simple: type to filter → space to tick → enter when done
+ * Hierarchical tree view with pagination
  */
 
 import inquirer from 'inquirer';
@@ -16,13 +16,12 @@ const IGNORE_DIRS = new Set([
     'obj', 'bin', 'packages', '.vs', 'TestResults'
 ]);
 
+const PAGE_SIZE = 50;
+
 function shouldIgnore(name) {
     return IGNORE_DIRS.has(name) || name.startsWith('.');
 }
 
-/**
- * Build file index
- */
 function buildFileIndex(baseDir, maxDepth = 8) {
     const files = [];
 
@@ -32,7 +31,6 @@ function buildFileIndex(baseDir, maxDepth = 8) {
         try {
             const entries = readdirSync(dir, { withFileTypes: true });
 
-            // Sort: folders first, then files
             entries.sort((a, b) => {
                 if (a.isDirectory() && !b.isDirectory()) return -1;
                 if (!a.isDirectory() && b.isDirectory()) return 1;
@@ -49,7 +47,8 @@ function buildFileIndex(baseDir, maxDepth = 8) {
                     name: entry.name,
                     path: fullPath,
                     relativePath,
-                    isDirectory: entry.isDirectory()
+                    isDirectory: entry.isDirectory(),
+                    depth
                 });
 
                 if (entry.isDirectory()) {
@@ -63,9 +62,6 @@ function buildFileIndex(baseDir, maxDepth = 8) {
     return files;
 }
 
-/**
- * Get all files in a directory recursively  
- */
 function getFilesInDirectory(dir) {
     const files = [];
 
@@ -88,21 +84,69 @@ function getFilesInDirectory(dir) {
     return files;
 }
 
-/**
- * Format item for checkbox display
- */
-function formatItem(item, depth = 0) {
-    const indent = '  '.repeat(depth);
+function formatTreeItem(item) {
+    const indent = '  '.repeat(item.depth);
     const icon = item.isDirectory ? '📁' : '📄';
     const name = item.isDirectory
-        ? chalk.blue.bold(item.name + sep)
+        ? chalk.blue.bold(item.name)
         : chalk.white(item.name);
     return `${indent}${icon} ${name}`;
 }
 
 /**
- * Main file selector - simple checkbox with search loop
+ * Show paginated results with Load More option
  */
+async function showPaginatedResults(filtered, selectedPaths, page = 0) {
+    const start = page * PAGE_SIZE;
+    const end = Math.min(start + PAGE_SIZE, filtered.length);
+    const pageItems = filtered.slice(start, end);
+    const hasMore = end < filtered.length;
+    const remaining = filtered.length - end;
+
+    // Build choices
+    const choices = pageItems.map(f => {
+        let isChecked = false;
+        if (f.isDirectory) {
+            const childFiles = getFilesInDirectory(f.path);
+            isChecked = childFiles.length > 0 && childFiles.every(fp => selectedPaths.has(fp));
+        } else {
+            isChecked = selectedPaths.has(f.path);
+        }
+
+        return {
+            name: formatTreeItem(f),
+            value: f,
+            checked: isChecked,
+            short: f.relativePath
+        };
+    });
+
+    // Add separator and load more option if there are more results
+    if (hasMore) {
+        choices.push(new inquirer.Separator(chalk.dim('─────────────────────────────')));
+        choices.push({
+            name: chalk.cyan(`⏬ Load next ${Math.min(PAGE_SIZE, remaining)} items (${remaining} remaining)`),
+            value: '__LOAD_MORE__',
+            short: 'Load more'
+        });
+    }
+
+    const pageInfo = `Page ${page + 1} (${start + 1}-${end} of ${filtered.length})`;
+
+    const { picked } = await inquirer.prompt([
+        {
+            type: 'checkbox',
+            name: 'picked',
+            message: `${pageInfo}:`,
+            choices,
+            pageSize: 25,
+            loop: false
+        }
+    ]);
+
+    return { picked, pageItems, hasMore };
+}
+
 export async function selectFiles(sourceDir) {
     console.log(chalk.cyan('\n📂 Scanning directory...'));
 
@@ -118,17 +162,15 @@ export async function selectFiles(sourceDir) {
     let continueLoop = true;
 
     console.log(chalk.cyan('🔍 File Selection'));
-    console.log(chalk.dim('   1. Type a search term to filter'));
-    console.log(chalk.dim('   2. Space to tick, Enter to confirm'));
-    console.log(chalk.dim('   3. Empty search + Enter = finish\n'));
+    console.log(chalk.dim('   • Type to filter → Space to tick → Enter to confirm'));
+    console.log(chalk.dim('   • Select "Load more" to see next batch'));
+    console.log(chalk.dim('   • Empty search = done\n'));
 
     while (continueLoop) {
-        // Show current count
         if (selectedPaths.size > 0) {
-            console.log(chalk.green(`\n   📦 ${selectedPaths.size} file(s) selected so far`));
+            console.log(chalk.green(`\n   📦 ${selectedPaths.size} file(s) selected`));
         }
 
-        // Get search term
         const { searchTerm } = await inquirer.prompt([
             {
                 type: 'input',
@@ -138,22 +180,19 @@ export async function selectFiles(sourceDir) {
             }
         ]);
 
-        // Empty = done
         if (!searchTerm.trim()) {
             if (selectedPaths.size === 0) {
                 const { confirmExit } = await inquirer.prompt([
                     { type: 'confirm', name: 'confirmExit', message: 'No files selected. Exit?', default: false }
                 ]);
-                if (confirmExit) {
-                    continueLoop = false;
-                }
+                if (confirmExit) continueLoop = false;
             } else {
                 continueLoop = false;
             }
             continue;
         }
 
-        // Filter files by search term
+        // Filter by search term
         const query = searchTerm.toLowerCase();
         const filtered = fileIndex.filter(f =>
             f.relativePath.toLowerCase().includes(query) ||
@@ -161,51 +200,57 @@ export async function selectFiles(sourceDir) {
         );
 
         if (filtered.length === 0) {
-            console.log(chalk.yellow('   No matches. Try different search.'));
+            console.log(chalk.yellow('   No matches found.'));
             continue;
         }
 
-        // Show checkbox for filtered items
-        const choices = filtered.slice(0, 50).map(f => ({
-            name: `${f.isDirectory ? '📁' : '📄'} ${f.relativePath}`,
-            value: f,
-            checked: selectedPaths.has(f.path)
-        }));
+        console.log(chalk.dim(`   Found ${filtered.length} matches`));
 
-        const { picked } = await inquirer.prompt([
-            {
-                type: 'checkbox',
-                name: 'picked',
-                message: `Matches (${filtered.length}):`,
-                choices,
-                pageSize: 20
+        // Pagination loop
+        let page = 0;
+        let continuePaging = true;
+
+        while (continuePaging) {
+            const { picked, pageItems, hasMore } = await showPaginatedResults(filtered, selectedPaths, page);
+
+            // Check if user selected "Load More"
+            const loadMore = picked.find(p => p === '__LOAD_MORE__');
+            const actualPicks = picked.filter(p => p !== '__LOAD_MORE__');
+
+            // Process deselections for this page
+            const pickedPaths = new Set(actualPicks.map(p => p.path));
+            for (const f of pageItems) {
+                if (!pickedPaths.has(f.path)) {
+                    if (f.isDirectory) {
+                        const childFiles = getFilesInDirectory(f.path);
+                        childFiles.forEach(fp => selectedPaths.delete(fp));
+                    } else {
+                        selectedPaths.delete(f.path);
+                    }
+                }
             }
-        ]);
 
-        // Update selections
-        // First, remove any previously selected items in this filtered set that are now unchecked
-        for (const f of filtered.slice(0, 50)) {
-            if (f.isDirectory) {
-                const filesInDir = getFilesInDirectory(f.path);
-                filesInDir.forEach(fp => selectedPaths.delete(fp));
-            } else {
-                selectedPaths.delete(f.path);
+            // Process selections
+            for (const f of actualPicks) {
+                if (f.isDirectory) {
+                    const childFiles = getFilesInDirectory(f.path);
+                    childFiles.forEach(fp => selectedPaths.add(fp));
+                    console.log(chalk.green(`   + 📁 ${f.relativePath}/ (${childFiles.length} files)`));
+                } else {
+                    selectedPaths.add(f.path);
+                    console.log(chalk.green(`   + 📄 ${f.relativePath}`));
+                }
             }
-        }
 
-        // Add newly selected items
-        for (const f of picked) {
-            if (f.isDirectory) {
-                const filesInDir = getFilesInDirectory(f.path);
-                filesInDir.forEach(fp => selectedPaths.add(fp));
-                console.log(chalk.green(`   + ${filesInDir.length} files from ${f.relativePath}/`));
+            // Handle load more or exit pagination
+            if (loadMore && hasMore) {
+                page++;
             } else {
-                selectedPaths.add(f.path);
-                console.log(chalk.green(`   + ${f.relativePath}`));
+                continuePaging = false;
             }
         }
     }
 
-    console.log(chalk.green(`\n✓ Selected ${selectedPaths.size} files total\n`));
+    console.log(chalk.green(`\n✓ Total: ${selectedPaths.size} files selected\n`));
     return Array.from(selectedPaths);
 }

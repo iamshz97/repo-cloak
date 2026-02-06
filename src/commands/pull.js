@@ -85,10 +85,15 @@ export async function pull(options = {}) {
             (current, total, file) => {
                 lastFile = file;
                 spinner.text = `Copying files... ${current}/${total} - ${file}`;
-            }
+            },
+            replacements  // Pass replacements for path anonymization
         );
 
         spinner.succeed(`Copied ${results.copied} files`);
+
+        if (results.pathsRenamed > 0) {
+            console.log(chalk.cyan(`   📁 ${results.pathsRenamed} paths renamed`));
+        }
 
         if (results.transformed > 0) {
             console.log(chalk.cyan(`   📝 ${results.transformed} files had content replaced`));
@@ -101,14 +106,24 @@ export async function pull(options = {}) {
             });
         }
 
-        // Step 8: Save mapping file
+        // Step 8: Save mapping file with original->anonymized path tracking
         const mapping = createMapping({
             sourceDir,
             destDir,
             replacements,
-            files: selectedFiles.map(f => ({
-                relativePath: relative(sourceDir, f)
-            }))
+            files: selectedFiles.map(f => {
+                const originalPath = relative(sourceDir, f);
+                // Apply same anonymization logic used in copier
+                let anonymizedPath = originalPath;
+                for (const { original, replacement } of replacements) {
+                    const regex = new RegExp(original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                    anonymizedPath = anonymizedPath.replace(regex, replacement);
+                }
+                return {
+                    original: originalPath,
+                    cloaked: anonymizedPath
+                };
+            })
         });
 
         const mapPath = saveMapping(destDir, mapping);
