@@ -19,13 +19,13 @@ Perfect for sharing code with AI agents without exposing proprietary details. Ex
 ## 📦 Installation
 
 ```bash
-npm install -g repo-cloak
+npm install -g repo-cloak-cli
 ```
 
 Or use directly with npx:
 
 ```bash
-npx repo-cloak
+npx repo-cloak-cli
 ```
 
 ## 🚀 Quick Start
