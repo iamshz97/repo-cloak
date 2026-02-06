@@ -1,0 +1,92 @@
+name: Release & Publish
+
+on:
+  # Manual trigger with version bump
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+  # Auto-publish on push (only if version changed)
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'package.json'
+      - 'src/**'
+      - 'bin/**'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🎭 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 🔧 Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 📥 Install dependencies
+        run: npm ci
+
+      - name: 📝 Bump version (manual trigger only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          npm version ${{ inputs.version_type }} -m "chore: release v%s"
+          git push --follow-tags
+
+      - name: 🔍 Check if version exists on npm
+        id: check_version
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          
+          # Check if this version already exists on npm
+          NPM_VERSION=$(npm view $PACKAGE_NAME version 2>/dev/null || echo "0.0.0")
+          
+          echo "Local version: $LOCAL_VERSION"
+          echo "npm version: $NPM_VERSION"
+          
+          if [ "$LOCAL_VERSION" = "$NPM_VERSION" ]; then
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Version $LOCAL_VERSION already exists on npm, skipping publish"
+          else
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+            echo "✅ Version $LOCAL_VERSION is new, will publish"
+          fi
+
+      - name: 🚀 Publish to npm
+        if: steps.check_version.outputs.should_publish == 'true'
+        run: |
+          npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: ✅ Done
+        run: |
+          if [ "${{ steps.check_version.outputs.should_publish }}" = "true" ]; then
+            echo "🎉 Published successfully!"
+          else
+            echo "ℹ️ No publish needed - version unchanged"
+          fi
