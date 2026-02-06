@@ -1,182 +1,211 @@
 /**
  * Interactive File Selector
- * Allows users to browse and select files/folders with search
+ * Simple: type to filter → space to tick → enter when done
  */
 
 import inquirer from 'inquirer';
 import chalk from 'chalk';
-import { readdirSync, statSync } from 'fs';
+import { readdirSync } from 'fs';
 import { join, relative, sep } from 'path';
 
+// Directories to always ignore
+const IGNORE_DIRS = new Set([
+    'node_modules', '.git', '.svn', '.hg', '.DS_Store', 'Thumbs.db',
+    '.idea', '.vscode', '__pycache__', '.pytest_cache', 'dist', 'build',
+    '.next', '.nuxt', 'coverage', '.nyc_output', '.repo-cloak-map.json',
+    'obj', 'bin', 'packages', '.vs', 'TestResults'
+]);
+
+function shouldIgnore(name) {
+    return IGNORE_DIRS.has(name) || name.startsWith('.');
+}
+
 /**
- * Recursively get all files and folders in a directory
+ * Build file index
  */
-function getFileTree(dir, basePath = dir, depth = 0, maxDepth = 10) {
-    const items = [];
+function buildFileIndex(baseDir, maxDepth = 8) {
+    const files = [];
 
-    if (depth > maxDepth) return items;
+    function scan(dir, depth = 0) {
+        if (depth > maxDepth) return;
 
-    try {
-        const entries = readdirSync(dir, { withFileTypes: true });
+        try {
+            const entries = readdirSync(dir, { withFileTypes: true });
 
-        // Sort: folders first, then files, both alphabetically
-        entries.sort((a, b) => {
-            if (a.isDirectory() && !b.isDirectory()) return -1;
-            if (!a.isDirectory() && b.isDirectory()) return 1;
-            return a.name.localeCompare(b.name);
-        });
+            // Sort: folders first, then files
+            entries.sort((a, b) => {
+                if (a.isDirectory() && !b.isDirectory()) return -1;
+                if (!a.isDirectory() && b.isDirectory()) return 1;
+                return a.name.localeCompare(b.name);
+            });
 
-        for (const entry of entries) {
-            const fullPath = join(dir, entry.name);
-            const relativePath = relative(basePath, fullPath);
+            for (const entry of entries) {
+                if (shouldIgnore(entry.name)) continue;
 
-            // Skip common ignored directories
-            if (shouldIgnore(entry.name)) continue;
+                const fullPath = join(dir, entry.name);
+                const relativePath = relative(baseDir, fullPath);
 
-            if (entry.isDirectory()) {
-                items.push({
+                files.push({
                     name: entry.name,
                     path: fullPath,
                     relativePath,
-                    isDirectory: true,
-                    depth
+                    isDirectory: entry.isDirectory()
                 });
 
-                // Recursively get children
-                const children = getFileTree(fullPath, basePath, depth + 1, maxDepth);
-                items.push(...children);
-            } else {
-                items.push({
-                    name: entry.name,
-                    path: fullPath,
-                    relativePath,
-                    isDirectory: false,
-                    depth
-                });
+                if (entry.isDirectory()) {
+                    scan(fullPath, depth + 1);
+                }
             }
-        }
-    } catch (error) {
-        // Permission denied or other errors - skip this directory
+        } catch (error) { }
     }
 
-    return items;
+    scan(baseDir);
+    return files;
 }
 
 /**
- * Check if a file/folder should be ignored
+ * Get all files in a directory recursively  
  */
-function shouldIgnore(name) {
-    const ignoreList = [
-        'node_modules',
-        '.git',
-        '.svn',
-        '.hg',
-        '.DS_Store',
-        'Thumbs.db',
-        '.idea',
-        '.vscode',
-        '__pycache__',
-        '.pytest_cache',
-        'dist',
-        'build',
-        '.next',
-        '.nuxt',
-        'coverage',
-        '.nyc_output',
-        '.repo-cloak-map.json'
-    ];
+function getFilesInDirectory(dir) {
+    const files = [];
 
-    return ignoreList.includes(name) || name.startsWith('.');
+    function collect(currentDir) {
+        try {
+            const entries = readdirSync(currentDir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (shouldIgnore(entry.name)) continue;
+                const fullPath = join(currentDir, entry.name);
+                if (entry.isDirectory()) {
+                    collect(fullPath);
+                } else {
+                    files.push(fullPath);
+                }
+            }
+        } catch (error) { }
+    }
+
+    collect(dir);
+    return files;
 }
 
 /**
- * Format a file tree item for display
+ * Format item for checkbox display
  */
-function formatItem(item, selected) {
-    const indent = '  '.repeat(item.depth);
+function formatItem(item, depth = 0) {
+    const indent = '  '.repeat(depth);
     const icon = item.isDirectory ? '📁' : '📄';
-    const prefix = selected ? chalk.green('✓ ') : '  ';
     const name = item.isDirectory
         ? chalk.blue.bold(item.name + sep)
         : chalk.white(item.name);
-
-    return `${prefix}${indent}${icon} ${name}`;
+    return `${indent}${icon} ${name}`;
 }
 
 /**
- * Interactive file selector with search and multi-select
+ * Main file selector - simple checkbox with search loop
  */
 export async function selectFiles(sourceDir) {
-    console.log(chalk.cyan('\n📂 Scanning directory...\n'));
+    console.log(chalk.cyan('\n📂 Scanning directory...'));
 
-    const fileTree = getFileTree(sourceDir);
+    const fileIndex = buildFileIndex(sourceDir);
+    console.log(chalk.dim(`   Found ${fileIndex.length} items\n`));
 
-    if (fileTree.length === 0) {
-        console.log(chalk.yellow('No files found in this directory.'));
+    if (fileIndex.length === 0) {
+        console.log(chalk.yellow('   No files found.'));
         return [];
     }
 
-    console.log(chalk.dim(`Found ${fileTree.length} items\n`));
+    const selectedPaths = new Set();
+    let continueLoop = true;
 
-    // Create choices for inquirer
-    const choices = fileTree.map(item => ({
-        name: formatItem(item, false),
-        value: item.path,
-        short: item.relativePath,
-        checked: false,
-        item // Store original item for reference
-    }));
+    console.log(chalk.cyan('🔍 File Selection'));
+    console.log(chalk.dim('   1. Type a search term to filter'));
+    console.log(chalk.dim('   2. Space to tick, Enter to confirm'));
+    console.log(chalk.dim('   3. Empty search + Enter = finish\n'));
 
-    // Use inquirer checkbox with search
-    const { selectedFiles } = await inquirer.prompt([
-        {
-            type: 'checkbox',
-            name: 'selectedFiles',
-            message: 'Select files and folders to extract (space to select, enter to confirm):',
-            choices,
-            pageSize: 20,
-            loop: false,
-            validate: (answer) => {
-                if (answer.length === 0) {
-                    return 'Please select at least one file or folder.';
+    while (continueLoop) {
+        // Show current count
+        if (selectedPaths.size > 0) {
+            console.log(chalk.green(`\n   📦 ${selectedPaths.size} file(s) selected so far`));
+        }
+
+        // Get search term
+        const { searchTerm } = await inquirer.prompt([
+            {
+                type: 'input',
+                name: 'searchTerm',
+                message: 'Filter (empty = done):',
+                prefix: '🔎'
+            }
+        ]);
+
+        // Empty = done
+        if (!searchTerm.trim()) {
+            if (selectedPaths.size === 0) {
+                const { confirmExit } = await inquirer.prompt([
+                    { type: 'confirm', name: 'confirmExit', message: 'No files selected. Exit?', default: false }
+                ]);
+                if (confirmExit) {
+                    continueLoop = false;
                 }
-                return true;
+            } else {
+                continueLoop = false;
+            }
+            continue;
+        }
+
+        // Filter files by search term
+        const query = searchTerm.toLowerCase();
+        const filtered = fileIndex.filter(f =>
+            f.relativePath.toLowerCase().includes(query) ||
+            f.name.toLowerCase().includes(query)
+        );
+
+        if (filtered.length === 0) {
+            console.log(chalk.yellow('   No matches. Try different search.'));
+            continue;
+        }
+
+        // Show checkbox for filtered items
+        const choices = filtered.slice(0, 50).map(f => ({
+            name: `${f.isDirectory ? '📁' : '📄'} ${f.relativePath}`,
+            value: f,
+            checked: selectedPaths.has(f.path)
+        }));
+
+        const { picked } = await inquirer.prompt([
+            {
+                type: 'checkbox',
+                name: 'picked',
+                message: `Matches (${filtered.length}):`,
+                choices,
+                pageSize: 20
+            }
+        ]);
+
+        // Update selections
+        // First, remove any previously selected items in this filtered set that are now unchecked
+        for (const f of filtered.slice(0, 50)) {
+            if (f.isDirectory) {
+                const filesInDir = getFilesInDirectory(f.path);
+                filesInDir.forEach(fp => selectedPaths.delete(fp));
+            } else {
+                selectedPaths.delete(f.path);
             }
         }
-    ]);
 
-    // Expand selected directories to include all their contents
-    const expandedSelection = new Set();
-
-    for (const path of selectedFiles) {
-        expandedSelection.add(path);
-
-        // If it's a directory, add all children
-        const item = fileTree.find(f => f.path === path);
-        if (item && item.isDirectory) {
-            for (const child of fileTree) {
-                if (child.path.startsWith(path + sep)) {
-                    expandedSelection.add(child.path);
-                }
+        // Add newly selected items
+        for (const f of picked) {
+            if (f.isDirectory) {
+                const filesInDir = getFilesInDirectory(f.path);
+                filesInDir.forEach(fp => selectedPaths.add(fp));
+                console.log(chalk.green(`   + ${filesInDir.length} files from ${f.relativePath}/`));
+            } else {
+                selectedPaths.add(f.path);
+                console.log(chalk.green(`   + ${f.relativePath}`));
             }
         }
     }
 
-    // Filter to only include files (for copying)
-    const filesToCopy = Array.from(expandedSelection).filter(path => {
-        const item = fileTree.find(f => f.path === path);
-        return item && !item.isDirectory;
-    });
-
-    return filesToCopy;
-}
-
-/**
- * Search files by name pattern
- */
-export async function searchFiles(sourceDir, pattern) {
-    const fileTree = getFileTree(sourceDir);
-    const regex = new RegExp(pattern, 'i');
-
-    return fileTree.filter(item => regex.test(item.name));
+    console.log(chalk.green(`\n✓ Selected ${selectedPaths.size} files total\n`));
+    return Array.from(selectedPaths);
 }
