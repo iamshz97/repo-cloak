@@ -4,7 +4,7 @@
 
 Perfect for sharing code with AI agents without exposing proprietary details. Extract specific files, replace sensitive information (company names, project names, etc.), and restore them later.
 
-[![npm version](https://img.shields.io/npm/v/repo-cloak.svg)](https://www.npmjs.com/package/repo-cloak)
+[![npm version](https://img.shields.io/npm/v/repo-cloak-cli.svg)](https://www.npmjs.com/package/repo-cloak-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## ✨ Features
