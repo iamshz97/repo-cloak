@@ -1,10 +1,12 @@
 /**
  * Pull Command
  * Extract files and anonymize sensitive information
+ * Supports quick-add mode when pulling to existing cloaked directory
  */
 
 import ora from 'ora';
 import chalk from 'chalk';
+import inquirer from 'inquirer';
 import { existsSync, mkdirSync } from 'fs';
 import { resolve, relative } from 'path';
 
@@ -13,29 +15,117 @@ import {
     promptSourceDirectory,
     promptDestinationDirectory,
     promptKeywordReplacements,
-    showSummaryAndConfirm
+    showSummaryAndConfirm,
+    confirmAction
 } from '../ui/prompts.js';
 import { showSuccess, showError, showInfo } from '../ui/banner.js';
 import { getAllFiles } from '../core/scanner.js';
 import { copyFiles } from '../core/copier.js';
 import { createAnonymizer } from '../core/anonymizer.js';
-import { createMapping, saveMapping, loadRawMapping, mergeMapping, hasMapping } from '../core/mapper.js';
+import { createMapping, saveMapping, loadRawMapping, mergeMapping, hasMapping, decryptMapping } from '../core/mapper.js';
+import { getOrCreateSecret, hasSecret, decryptReplacements } from '../core/crypto.js';
 
 export async function pull(options = {}) {
     try {
-        // Step 1: Get source directory
-        const sourceDir = options.source
-            ? resolve(options.source)
-            : await promptSourceDirectory();
+        let destDir = null;
+        let existingMapping = null;
+        let existingReplacements = [];
+        let sourceDir = null;
+        let isQuickAdd = false;
+
+        // Step 1: Check if current directory is already a cloaked directory
+        const currentDir = process.cwd();
+
+        if (hasMapping(currentDir) && !options.dest) {
+            // Running from inside an existing cloaked directory - auto-detect!
+            destDir = currentDir;
+            existingMapping = loadRawMapping(destDir);
+
+            console.log(chalk.cyan('\n   Existing cloaked directory detected'));
+            console.log(chalk.dim(`   Created: ${existingMapping.timestamp}`));
+            console.log(chalk.dim(`   Files: ${existingMapping.stats?.totalFiles || existingMapping.files?.length || 0}`));
+            console.log(chalk.dim(`   Replacements: ${existingMapping.replacements?.length || 0}\n`));
+
+            // Ask if they want quick-add mode
+            const { mode } = await inquirer.prompt([
+                {
+                    type: 'list',
+                    name: 'mode',
+                    message: 'What would you like to do?',
+                    choices: [
+                        {
+                            name: 'Quick Add - Use existing replacements and add more files',
+                            value: 'quick'
+                        },
+                        {
+                            name: 'Add More Replacements - Add files with additional anonymization',
+                            value: 'extend'
+                        },
+                        {
+                            name: 'Fresh Start - Choose new destination',
+                            value: 'fresh'
+                        }
+                    ]
+                }
+            ]);
+
+            if (mode === 'fresh') {
+                // Get a new destination
+                destDir = await promptDestinationDirectory();
+                existingMapping = null;
+            } else {
+                isQuickAdd = mode === 'quick';
+
+                // Decrypt existing replacements
+                if (existingMapping.encrypted && hasSecret()) {
+                    const secret = getOrCreateSecret();
+                    try {
+                        const decrypted = decryptReplacements(existingMapping.replacements || [], secret);
+                        existingReplacements = decrypted.filter(r => !r.decryptFailed);
+
+                        if (existingReplacements.length > 0) {
+                            console.log(chalk.green('   Existing replacements loaded:\n'));
+                            existingReplacements.forEach(r => {
+                                console.log(chalk.dim(`      "${r.original}" → "${r.replacement}"`));
+                            });
+                            console.log('');
+                        }
+                    } catch (err) {
+                        console.log(chalk.yellow('   Could not decrypt existing replacements'));
+                    }
+                }
+
+                // Try to get original source path
+                if (existingMapping.encrypted && hasSecret()) {
+                    const secret = getOrCreateSecret();
+                    try {
+                        const decrypted = decryptMapping(existingMapping, secret);
+                        if (decrypted.source?.path && existsSync(decrypted.source.path)) {
+                            sourceDir = decrypted.source.path;
+                            console.log(chalk.dim(`   Source: ${sourceDir}\n`));
+                        }
+                    } catch (err) {
+                        // Source path couldn't be decrypted, will prompt
+                    }
+                }
+            }
+        }
+
+        // Step 3: Get source directory if not already determined
+        if (!sourceDir) {
+            sourceDir = options.source
+                ? resolve(options.source)
+                : await promptSourceDirectory();
+        }
 
         if (!existsSync(sourceDir)) {
             showError(`Source directory does not exist: ${sourceDir}`);
             return;
         }
 
-        console.log(chalk.dim(`\n   Source: ${sourceDir}\n`));
+        console.log(chalk.dim(`   Source: ${sourceDir}\n`));
 
-        // Step 2: Select files
+        // Step 4: Select files
         const selectedFiles = await selectFiles(sourceDir);
 
         if (selectedFiles.length === 0) {
@@ -45,15 +135,40 @@ export async function pull(options = {}) {
 
         console.log(chalk.green(`\n✓ Selected ${selectedFiles.length} files\n`));
 
-        // Step 3: Get destination directory
-        const destDir = options.dest
-            ? resolve(options.dest)
-            : await promptDestinationDirectory();
+        // Step 5: Handle replacements based on mode
+        let replacements = [...existingReplacements];
 
-        // Step 4: Get keyword replacements
-        const replacements = await promptKeywordReplacements();
+        if (isQuickAdd) {
+            // Quick add mode - just use existing replacements
+            if (replacements.length > 0) {
+                console.log(chalk.cyan('   Using existing replacements (quick-add mode)\n'));
+            }
 
-        // Step 5: Confirm
+            // Ask if they want to add more
+            const { addMore } = await inquirer.prompt([
+                {
+                    type: 'confirm',
+                    name: 'addMore',
+                    message: 'Add additional replacements?',
+                    default: false
+                }
+            ]);
+
+            if (addMore) {
+                const additionalReplacements = await promptKeywordReplacements();
+                replacements = [...replacements, ...additionalReplacements];
+            }
+        } else if (existingMapping) {
+            // Extend mode - prompt for more replacements to add to existing
+            console.log(chalk.cyan('\n   Add more replacements (existing will be preserved):\n'));
+            const additionalReplacements = await promptKeywordReplacements();
+            replacements = [...replacements, ...additionalReplacements];
+        } else {
+            // Fresh start - prompt for all replacements
+            replacements = await promptKeywordReplacements();
+        }
+
+        // Step 6: Confirm
         const confirmed = await showSummaryAndConfirm(
             selectedFiles.length,
             destDir,
@@ -65,13 +180,13 @@ export async function pull(options = {}) {
             return;
         }
 
-        // Step 6: Create destination directory
+        // Step 7: Create destination directory
         if (!existsSync(destDir)) {
             mkdirSync(destDir, { recursive: true });
             console.log(chalk.dim(`   Created directory: ${destDir}`));
         }
 
-        // Step 7: Copy and anonymize files
+        // Step 8: Copy and anonymize files
         const spinner = ora('Copying and anonymizing files...').start();
 
         const anonymizer = createAnonymizer(replacements);
@@ -106,7 +221,7 @@ export async function pull(options = {}) {
             });
         }
 
-        // Step 8: Prepare new file mappings
+        // Step 9: Prepare new file mappings
         const newFiles = selectedFiles.map(f => {
             const originalPath = relative(sourceDir, f);
             let anonymizedPath = originalPath;
@@ -120,8 +235,7 @@ export async function pull(options = {}) {
             };
         });
 
-        // Step 9: Check for existing mapping and merge if found
-        const existingMapping = loadRawMapping(destDir);
+        // Step 10: Check for existing mapping and merge if found
         let mapping;
         let isIncremental = false;
 
@@ -129,7 +243,7 @@ export async function pull(options = {}) {
             // Merge with existing
             mapping = mergeMapping(existingMapping, newFiles);
             isIncremental = true;
-            console.log(chalk.cyan(`   🔄 Merged with existing mapping (incremental pull)`));
+            console.log(chalk.cyan(`   🔄 Merged with existing mapping`));
         } else {
             // Create new mapping
             mapping = createMapping({
@@ -153,7 +267,12 @@ export async function pull(options = {}) {
         // Done!
         showSuccess('Extraction complete!');
         console.log(chalk.white(`   📂 Files extracted to: ${chalk.cyan.bold(destDir)}`));
-        console.log(chalk.dim(`\n   To restore later, run: ${chalk.white('repo-cloak push')}\n`));
+
+        if (isQuickAdd || isIncremental) {
+            console.log(chalk.dim(`\n   Tip: Run again to add more files quickly\n`));
+        } else {
+            console.log(chalk.dim(`\n   To restore later, run: ${chalk.white('repo-cloak push')}\n`));
+        }
 
     } catch (error) {
         showError(`Pull failed: ${error.message}`);
