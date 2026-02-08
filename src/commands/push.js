@@ -24,10 +24,20 @@ import { getOrCreateSecret, hasSecret, decrypt, getConfigDir } from '../core/cry
 
 export async function push(options = {}) {
     try {
-        // Step 1: Get source (cloaked) directory
-        const cloakedDir = options.source
-            ? resolve(options.source)
-            : await promptBackupFolder();
+        // Step 1: Check if current directory has a mapping (auto-detect)
+        const currentDir = process.cwd();
+        let cloakedDir;
+
+        if (hasMapping(currentDir) && !options.source) {
+            // Running from inside a cloaked directory - use it directly
+            cloakedDir = currentDir;
+            console.log(chalk.cyan('\n   Cloaked directory detected in current folder'));
+        } else {
+            // Ask for the source directory
+            cloakedDir = options.source
+                ? resolve(options.source)
+                : await promptBackupFolder();
+        }
 
         if (!existsSync(cloakedDir)) {
             showError(`Directory does not exist: ${cloakedDir}`);

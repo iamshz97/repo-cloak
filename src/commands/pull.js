@@ -24,6 +24,7 @@ import { copyFiles } from '../core/copier.js';
 import { createAnonymizer } from '../core/anonymizer.js';
 import { createMapping, saveMapping, loadRawMapping, mergeMapping, hasMapping, decryptMapping } from '../core/mapper.js';
 import { getOrCreateSecret, hasSecret, decryptReplacements } from '../core/crypto.js';
+import { isGitRepo, getChangedFiles } from '../core/git.js';
 
 export async function pull(options = {}) {
     try {
@@ -109,7 +110,78 @@ export async function pull(options = {}) {
                     }
                 }
             }
+        } else {
+            // Not running from a cloaked directory - ask for destination
+            destDir = options.dest
+                ? resolve(options.dest)
+                : await promptDestinationDirectory();
+
+            // Check if the chosen destination has an existing mapping
+            if (existsSync(destDir) && hasMapping(destDir)) {
+                existingMapping = loadRawMapping(destDir);
+
+                console.log(chalk.cyan('\n   Existing cloaked directory detected'));
+                console.log(chalk.dim(`   Created: ${existingMapping.timestamp}`));
+                console.log(chalk.dim(`   Files: ${existingMapping.stats?.totalFiles || existingMapping.files?.length || 0}`));
+                console.log(chalk.dim(`   Replacements: ${existingMapping.replacements?.length || 0}\n`));
+
+                // Ask if they want quick-add mode
+                const { mode } = await inquirer.prompt([
+                    {
+                        type: 'list',
+                        name: 'mode',
+                        message: 'What would you like to do?',
+                        choices: [
+                            { name: 'Quick Add - Use existing replacements and add more files', value: 'quick' },
+                            { name: 'Add More Replacements - Add files with additional anonymization', value: 'extend' },
+                            { name: 'Fresh Start - Choose new destination', value: 'fresh' }
+                        ]
+                    }
+                ]);
+
+                if (mode === 'fresh') {
+                    destDir = await promptDestinationDirectory();
+                    existingMapping = null;
+                } else {
+                    isQuickAdd = mode === 'quick';
+
+                    // Decrypt existing replacements
+                    if (existingMapping.encrypted && hasSecret()) {
+                        const secret = getOrCreateSecret();
+                        try {
+                            const decrypted = decryptReplacements(existingMapping.replacements || [], secret);
+                            existingReplacements = decrypted.filter(r => !r.decryptFailed);
+
+                            if (existingReplacements.length > 0) {
+                                console.log(chalk.green('   Existing replacements loaded:\n'));
+                                existingReplacements.forEach(r => {
+                                    console.log(chalk.dim(`      "${r.original}" → "${r.replacement}"`));
+                                });
+                                console.log('');
+                            }
+                        } catch (err) {
+                            console.log(chalk.yellow('   Could not decrypt existing replacements'));
+                        }
+                    }
+
+                    // Try to get original source path
+                    if (existingMapping.encrypted && hasSecret()) {
+                        const secret = getOrCreateSecret();
+                        try {
+                            const decrypted = decryptMapping(existingMapping, secret);
+                            if (decrypted.source?.path && existsSync(decrypted.source.path)) {
+                                sourceDir = decrypted.source.path;
+                                console.log(chalk.dim(`   Source: ${sourceDir}\n`));
+                            }
+                        } catch (err) {
+                            // Source path couldn't be decrypted, will prompt
+                        }
+                    }
+                }
+            }
         }
+
+        // ...
 
         // Step 3: Get source directory if not already determined
         if (!sourceDir) {
@@ -125,8 +197,72 @@ export async function pull(options = {}) {
 
         console.log(chalk.dim(`   Source: ${sourceDir}\n`));
 
-        // Step 4: Select files
-        const selectedFiles = await selectFiles(sourceDir);
+        // Step 4: Select files (Check for Git integration first)
+        let selectedFiles = [];
+        let useGitFiles = false;
+
+        if (isGitRepo(sourceDir)) {
+            const { useGit } = await inquirer.prompt([
+                {
+                    type: 'confirm',
+                    name: 'useGit',
+                    message: 'Git repository detected. Do you want to select changed/added files?',
+                    default: false
+                }
+            ]);
+
+            if (useGit) {
+                const spinner = ora('Scanning changed files...').start();
+                const gitFiles = await getChangedFiles(sourceDir);
+                spinner.stop();
+
+                if (gitFiles.length === 0) {
+                    console.log(chalk.yellow('   No changed or added files found in Git status.'));
+                    const { fallback } = await inquirer.prompt([
+                        {
+                            type: 'confirm',
+                            name: 'fallback',
+                            message: 'Do you want to manually select files instead?',
+                            default: true
+                        }
+                    ]);
+
+                    if (!fallback) {
+                        return;
+                    }
+                } else {
+                    // Filter to absolute paths and exist check
+                    const validGitFiles = gitFiles
+                        .map(f => resolve(sourceDir, f))
+                        .filter(f => existsSync(f));
+
+                    if (validGitFiles.length > 0) {
+                        console.log(chalk.green(`   Found ${validGitFiles.length} changed files.`));
+
+                        // Let user confirm/deselect git files
+                        const { confirmGitFiles } = await inquirer.prompt([
+                            {
+                                type: 'checkbox',
+                                name: 'confirmGitFiles',
+                                message: 'Select changed files to extract:',
+                                choices: validGitFiles.map(f => ({
+                                    name: relative(sourceDir, f),
+                                    value: f,
+                                    checked: true
+                                }))
+                            }
+                        ]);
+
+                        selectedFiles = confirmGitFiles;
+                        useGitFiles = true;
+                    }
+                }
+            }
+        }
+
+        if (!useGitFiles || selectedFiles.length === 0) {
+            selectedFiles = await selectFiles(sourceDir);
+        }
 
         if (selectedFiles.length === 0) {
             showError('No files selected. Aborting.');
